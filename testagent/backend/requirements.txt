@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+langchain
+langgraph
+langchain-openai
+mcp-use
+fastmcp
+copilot-kit
+python-dotenv
