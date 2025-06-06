@@ -47,6 +47,8 @@ graph TD
     *   Implementing client-side "actions" (`useCopilotAction`) callable by the backend.
     *   Handling AG-UI event streaming.
     *   Connecting to the Agent Gateway (`runtimeUrl`).
+    *   Providing UI elements for selecting the desired LLM (e.g., OpenAI, Gemini, local Ollama models) and communicating this choice to the backend.
+    *   Displaying conversation history and offering controls for chat session management (e.g., initiating a new chat, clearing/restarting the current chat), typically by managing or requesting new `threadId`s.
 
 ### 2. Agent Gateway / Backend-for-Frontend (BFF)
 
@@ -55,18 +57,23 @@ graph TD
     *   Expose AG-UI compliant API endpoint(s).
     *   Handle authentication, authorization, and session management.
     *   Act as a bridge, routing requests to the Agent Orchestration Layer and streaming responses back.
+    *   Receiving the selected LLM preference from the frontend and passing it to the Agent Orchestration Layer.
+    *   Interpreting session management cues from the frontend (e.g., requests for a new chat) to ensure appropriate `threadId` handling when relaying to the Agent Orchestration Layer.
 
 ### 3. Agent Orchestration Layer (The "Brain")
 
-*   **Technology**: **LangGraph** (Python) for core logic, **`mcp-use`** (Python) for MCP tool consumption, integrated with LLMs (via LangChain or direct SDKs).
+*   **Technology**: **LangGraph** (Python) for core logic, **`langchain-mcp-adapters`** (Python) for MCP tool consumption (using `MultiServerMCPClient`), integrated with LLMs (via LangChain or direct SDKs).
 *   **Responsibilities**:
     *   Define agent control flow (StateGraphs in LangGraph).
     *   Manage conversational state (compatible with AG-UI, e.g., `CopilotKitState`).
     *   Interface with LLMs for reasoning and decision-making.
-    *   Consume tools from FastMCP servers via `mcp-use`.
+    *   Consume tools from FastMCP servers by loading them as LangChain tools via `langchain-mcp-adapters`.
     *   Query LightRAG for knowledge retrieval.
     *   Invoke client-side actions on the AG-UI frontend.
     *   Implement Human-in-the-Loop (HITL) patterns.
+    *   Dynamically initializing or selecting the appropriate LLM client (e.g., LangChain's `ChatOpenAI`, `ChatGoogleGenerativeAI`, `ChatOllama`) based on the preference passed from the Agent Gateway.
+    *   Reliably managing chat history and state using LangGraph's checkpointer mechanism (e.g., `MemorySaver`), keyed by `thread_id` to support distinct conversations.
+    *   Supporting the creation of new chat sessions by operating on new `thread_id`s, effectively isolating conversation histories.
 
 ### 4. Tooling & Knowledge Layer (Backend Services)
 
@@ -220,95 +227,153 @@ if __name__ == "__main__":
 **4. Agent Orchestrator (`backend/orchestrators/echo_upper_orchestrator/graph.py`)**
 
 ```python
-# backend/orchestrators/echo_upper_orchestrator/graph.py
-import os
-from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
-from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END, START
+# backend/main_orchestrator.py
+# This would be your main Python file for the agent's brain.
+
+from typing import TypedDict, Annotated, Sequence, List
+import operator # For Annotated sequence addition
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage, ToolCall
+from langchain_core.pydantic_v1 import BaseModel
+from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import ToolNode
 
-from mcp_use import MCPClient # For calling FastMCP tools
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
-# --- MCP Client Setup ---
-# This config tells mcp-use how to start the string_tools server if not already running via HTTP.
-# If string_tools server is run independently (e.g., `python server.py` and exposed on a port),
-# mcp-use can connect via URL instead of command.
-mcp_config = {
-    "mcpServers": {
-        "string_tools": {
-            "command": "python3", # Use python3 based on memory
-            "args": [os.path.join(os.path.dirname(__file__), "..", "..", "mcp_servers", "string_tools", "server.py")],
-            "#url": "http://localhost:8001" # Example if running independently
-        }
+# --- MCP Client Setup (using langchain-mcp-adapters) ---
+mcp_client = MultiServerMCPClient({
+    "string_tools": {
+        "command": ["python3", "./backend/mcp_servers/string_tools/server.py"], # Adjust path as needed
+        "transport": "stdio",
+        # Example for an independently running server:
+        # "url": "http://localhost:8001/mcp", # Ensure port is correct
+        # "transport": "streamable_http",
     }
-}
-# Initialize MCPClient. In a real app, this might be a singleton or managed.
-mcp_client = MCPClient.from_dict(mcp_config)
+})
 
 # --- LangGraph State Definition ---
 class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], lambda x, y: x + y]
-    # Add other state variables as needed
+    messages: Annotated[Sequence[BaseMessage], operator.add]
 
 # --- LangGraph Nodes ---
-def call_llm_or_tools(state: AgentState):
+
+# Fetches tools from the MCP server using langchain-mcp-adapters
+async def get_mcp_tools():
+    return await mcp_client.get_tools()
+
+# Mock LLM: Simulates LLM behavior for the mini-example.
+# A real LLM (e.g., ChatOpenAI) would be bound to the tools.
+async def call_model_mock(state: AgentState):
     current_messages = state["messages"]
-    last_message_text = current_messages[-1].content.lower()
-    response_text = ""
+    last_message = current_messages[-1]
+    
+    if isinstance(last_message, ToolMessage):
+        # If the last message is a ToolMessage, a tool was just run.
+        # A real agent might feed this back to the LLM or decide the next step.
+        # For this mock, we'll consider the tool's output as a final part of the response.
+        return {"messages": [AIMessage(content=f"Tool '{last_message.name}' executed. Result: {last_message.content}")]}
 
-    if last_message_text.startswith("echo "):
-        response_text = last_message_text[5:] # Echo back
-    elif last_message_text.startswith("upper "):
-        text_to_upper = last_message_text[6:]
-        try:
-            # Call the FastMCP tool via mcp-use
-            # The first argument to call_tool is "server_name.tool_name"
-            tool_result = mcp_client.call_tool("string_tools.to_upper_case", {"text": text_to_upper})
-            response_text = tool_result.text
-        except Exception as e:
-            response_text = f"Error calling uppercase tool: {e}"
+    if not isinstance(last_message, HumanMessage):
+        return {"messages": [AIMessage(content="Error: Mock agent expects HumanMessage or ToolMessage as last message.")]}
+
+    content = last_message.content.lower()
+    tool_calls: List[ToolCall] = []
+
+    if content.startswith("echo "):
+        response_text = content[5:]
+        return {"messages": [AIMessage(content=response_text)]}
+    elif content.startswith("upper "):
+        text_to_upper = content[6:]
+        # Simulate LLM deciding to call the 'to_upper_case' tool.
+        # Tool name from FastMCP server 'to_upper_case' on server 'string_tools'
+        # becomes 'string_tools_to_upper_case' in LangChain's tool list.
+        tool_calls.append(
+            ToolCall(name="string_tools_to_upper_case",
+                     args={"text": text_to_upper},
+                     id="tool_call_upper_123")
+        )
+        return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
     else:
-        # Basic LLM fallback (optional, could just be specific commands)
-        # For simplicity, we'll just give a default response here.
-        # In a real agent, you'd use ChatOpenAI or similar.
         response_text = "Sorry, I can only 'echo <text>' or 'upper <text>'."
+        return {"messages": [AIMessage(content=response_text)]}
 
-    return {"messages": [AIMessage(content=response_text)]}
+# --- LangGraph Definition (Async to fetch tools) ---
+async def create_echo_upper_agent_graph():
+    tools = await get_mcp_tools() # Get LangChain-compatible tools
+    tool_node = ToolNode(tools)   # Node to execute these tools
 
-# --- LangGraph Definition ---
-workflow = StateGraph(AgentState)
-workflow.add_node("action_node", call_llm_or_tools)
-workflow.add_edge(START, "action_node")
-workflow.add_edge("action_node", END)
+    workflow = StateGraph(AgentState)
+    workflow.add_node("agent", call_model_mock) # Mock LLM node
+    workflow.add_node("tools", tool_node)       # Tool execution node
 
-# --- Compile Graph ---
-# This is the agent graph that the AG-UI server (Python part) would invoke.
-echo_upper_agent_graph = workflow.compile(checkpointer=MemorySaver())
+    workflow.set_entry_point("agent")
+
+    # Conditional edge: after 'agent' node, decide if to call 'tools' or end.
+    def should_invoke_tools(state: AgentState):
+        last_message = state["messages"][-1]
+        if isinstance(last_message, AIMessage) and hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            return "tools" # Route to tool_node if AIMessage has tool_calls
+        return END         # Otherwise, end the execution
+
+    workflow.add_conditional_edges("agent", should_invoke_tools)
+    
+    # After tools are executed, route back to the 'agent' node to process tool results.
+    workflow.add_edge("tools", "agent")
+    
+    # --- Compile Graph ---
+    # This is the agent graph that the AG-UI server (Python part) would invoke.
+    return workflow.compile(checkpointer=MemorySaver())
+
+# Note: The graph is now created by calling `await create_echo_upper_agent_graph()`.
+# The actual compiled graph is not a global variable here but would be obtained 
+# when the server starts or handles a request, as shown in `handle_ag_ui_request`.
 
 # --- AG-UI Server (Conceptual - to be run by your Python AG-UI Gateway) ---
 # To make this runnable with AG-UI, you'd need a Python server (e.g., FastAPI)
 # that implements the AG-UI protocol (handles SSE, message formats) and invokes
 # this `echo_upper_agent_graph.astream_events(...)` for each user session/request.
-
 # Example of how it might be invoked (highly simplified):
+# This part would typically be in your AG-UI Python Gateway/Server (e.g., a FastAPI endpoint).
+
+# Global variable to hold the compiled graph (initialized once upon first request or server start)
+echo_upper_agent_graph_compiled = None
+
+async def get_compiled_graph():
+    global echo_upper_agent_graph_compiled
+    if echo_upper_agent_graph_compiled is None:
+        # This is where the graph is created and compiled, only once.
+        echo_upper_agent_graph_compiled = await create_echo_upper_agent_graph()
+    return echo_upper_agent_graph_compiled
+
 async def handle_ag_ui_request(payload):
-    # 'payload' would contain user message, thread_id, etc.
-    # Map payload to initial AgentState
-    config = {"configurable": {"thread_id": payload.get("threadId", "default")}} # Example
-    initial_state = {"messages": [HumanMessage(content=payload["message"]["content"])]}
+    graph = await get_compiled_graph() # Get or create the compiled graph
+
+    # 'payload' would contain user message, thread_id, etc. from AG-UI
+    # Ensure robust access to payload elements
+    user_message_content = payload.get("message", {}).get("content", "")
+    thread_id = payload.get("threadId", "default_thread")
+
+    config = {"configurable": {"thread_id": thread_id}}
+    initial_state = {"messages": [HumanMessage(content=user_message_content)]}
     
-    async for event in echo_upper_agent_graph.astream_events(initial_state, config=config, version="v2"):
-        # Map LangGraph events to AG-UI SSE events and stream them back
-        # This is the part a Python AG-UI server library would handle.
-        print(f"AGENT EVENT: {event['event']}", event['data'])
-        if event['event'] == 'on_chat_model_stream' and event['data'].get('chunk'):
-            # yield AG-UI text_message_content event
-            pass
-        if event['event'] == 'on_chain_end' and event['data'].get('output'):
-            # This is where the final AIMessage is usually found in 'output['messages'][-1]'
-            # yield AG-UI text_message_end event
-            pass
+    async for event in graph.astream_events(initial_state, config=config, version="v2"):
+        # Map LangGraph events to AG-UI SSE events and stream them back.
+        # This is a simplified representation; a real AG-UI server would format these events.
+        print(f"AGENT EVENT: {event['event']}", event.get('data', {})) # Defensive get for data
+        
+        # Example: Forwarding AIMessage content as AG-UI text messages
+        # A more complete implementation would map various LangGraph events to AG-UI events.
+        if event['event'] == 'on_chain_end': 
+            output_data = event.get('data', {}).get('output', {})
+            if output_data: # Check if output_data is not None
+                 output_messages = output_data.get('messages', [])
+                 if output_messages and isinstance(output_messages[-1], AIMessage):
+                    final_content = output_messages[-1].content
+                    if final_content: # Only send if there's text content
+                        # This is where you'd send an AG-UI `text_message` event
+                        print(f"AG-UI (text_message_end): {final_content}")
+            # Further event mapping for tool calls, errors, etc., would go here.
 
 # To run this example (conceptually):
 # 1. Start the FastMCP server: `python3 backend/mcp_servers/string_tools/server.py`
